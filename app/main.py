@@ -6,6 +6,7 @@ import httpx
 import jwt
 from fastapi import FastAPI, Depends, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.database import get_db, init_db
@@ -39,6 +40,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class PaymentWebhookRequest(BaseModel):
+    payment_id: int
+    success: bool = True
+    gateway_reference: Optional[str] = Field(default=None, max_length=120)
+    failure_reason: Optional[str] = Field(default=None, max_length=255)
 
 
 def _decode_user_id(authorization: Optional[str]) -> Optional[int]:
@@ -97,6 +105,22 @@ async def _send_payment_notification(payment: Payment) -> int | None:
         return None
 
 
+async def _apply_payment_confirmation(
+    payment: Payment,
+    success: bool,
+    gateway_reference: Optional[str],
+    failure_reason: Optional[str],
+) -> None:
+    payment.status = PaymentStatus.SUCCEEDED.value if success else PaymentStatus.FAILED.value
+    payment.gateway_reference = gateway_reference
+    payment.failure_reason = failure_reason
+    payment.confirmed_at = datetime.utcnow()
+
+    notification_id = await _send_payment_notification(payment)
+    if notification_id:
+        payment.notification_id = notification_id
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
     init_db()
@@ -142,6 +166,35 @@ async def create_payment(
 
 
 @app.post(
+    "/api/v1/payments/intent",
+    summary="Create Payment Intent",
+    response_model=PaymentResponse,
+    status_code=201,
+)
+async def create_payment_intent(
+    payload: PaymentCreateRequest,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+) -> PaymentResponse:
+    user_id = _require_user_id(authorization)
+
+    payment = Payment(
+        order_id=payload.order_id,
+        customer_id=user_id,
+        amount=payload.amount,
+        currency=payload.currency.upper(),
+        method=payload.method.value,
+        status=PaymentStatus.PENDING.value,
+        customer_email=payload.customer_email,
+        customer_phone=payload.customer_phone,
+    )
+    db.add(payment)
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+@app.post(
     "/api/v1/payments/{payment_id}/confirm",
     summary="Confirm Payment",
     response_model=PaymentResponse,
@@ -158,14 +211,37 @@ async def confirm_payment(
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")
 
-    payment.status = PaymentStatus.SUCCEEDED.value if payload.success else PaymentStatus.FAILED.value
-    payment.gateway_reference = payload.gateway_reference
-    payment.failure_reason = payload.failure_reason
-    payment.confirmed_at = datetime.utcnow()
+    await _apply_payment_confirmation(
+        payment=payment,
+        success=payload.success,
+        gateway_reference=payload.gateway_reference,
+        failure_reason=payload.failure_reason,
+    )
 
-    notification_id = await _send_payment_notification(payment)
-    if notification_id:
-        payment.notification_id = notification_id
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+@app.post(
+    "/api/v1/payments/webhook",
+    summary="Payment Webhook",
+    response_model=PaymentResponse,
+)
+async def payment_webhook(
+    payload: PaymentWebhookRequest,
+    db: Session = Depends(get_db),
+) -> PaymentResponse:
+    payment = db.query(Payment).filter(Payment.id == payload.payment_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    await _apply_payment_confirmation(
+        payment=payment,
+        success=payload.success,
+        gateway_reference=payload.gateway_reference,
+        failure_reason=payload.failure_reason,
+    )
 
     db.commit()
     db.refresh(payment)
